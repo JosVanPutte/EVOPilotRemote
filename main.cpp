@@ -6,12 +6,16 @@ Target: ESP32-C3 (Access Point Mode, Fixed IP 192.168.4.1, Port 2222)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Preferences.h>
-
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include <memory>
 #include <RCSwitch.h>
+
+// FreeRTOS KOPPELING
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 // --- NMEA2000 & DRIVER SPECIFIEK VOOR ESP32-C3 ---
 #define ESP32_CAN_TX_PIN_SET ESP32_CAN_TX_PIN
@@ -39,6 +43,7 @@ Target: ESP32-C3 (Access Point Mode, Fixed IP 192.168.4.1, Port 2222)
 
 const uint16_t ServerPort = 2222; 
 const size_t MaxClients = 10;
+uint32_t last_ota_time = 0;
 
 NMEA2000_esp32_twai NMEA2000; // Ons centrale NMEA2000 object
 
@@ -47,7 +52,6 @@ WebServer configServer(80);    // Poort 80 voor de configuratie-pagina
 WiFiServer server(ServerPort, MaxClients);
 
 // --- WIFI ACCESS POINT CONFIG ---
-// Standaard AP gegevens als er nog niks is ingesteld
 const char* defaultAPSSID = "EVOPilotRemote";
 const char* defaultAPPass = ""; // open
 
@@ -65,12 +69,10 @@ tN2kDeviceList *pN2kDeviceList;
 int NodeAddress;
 Preferences preferences;
 RCSwitch mySwitch = RCSwitch();
-unsigned long key_time = 0;
 short pilotSourceAddress = -1;
 
-int beep_status = 0;
-unsigned long beep_on = 0;
-unsigned long beep_off = 0;
+// --- QUEUE VOOR COMMUNICATIE TUSSEN TASK EN LOOP ---
+QueueHandle_t remoteQueue;
 
 // --- REMOTE CODES (433 MHz) ---
 const unsigned long Key_Minus_10   = 1111001; 
@@ -95,8 +97,8 @@ const unsigned long ReceiveMessages[] PROGMEM = {
   129794UL,  // AIS Class A Static Data
   129809UL,  // AIS Class B Static Data Part A
   129810UL,  // AIS Class B Static Data Part B
-  65288UL,   // Read Seatalk Alarm State (Nodig voor de stuurautomaat)
-  65379UL,   // Read Pilot Mode (Nodig voor de stuurautomaat)
+  65288UL,   // Read Seatalk Alarm State
+  65379UL,   // Read Pilot Mode
   0
 };
 
@@ -104,11 +106,9 @@ const unsigned long ReceiveMessages[] PROGMEM = {
 void SendNMEA0183Message(const tNMEA0183Msg &NMEA0183Msg);
 void SendBufToClients(const char *buf);
 void CheckConnections();
-void Handle_AP_Remote();
-void handleBeep();
-void beepOn(int cnt);
+void ProcessRemoteKey(unsigned long key);
 void setupConfigServer();
-
+void vRemoteTask(void *pvParameters);
 //*****************************************************************************
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -126,36 +126,60 @@ void setup() {
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true);
   delay(200);
-    // Open Preferences met namespace "ap-config"
+  
   preferences.begin("ap-config", true);
   String apSSID = preferences.getString("ap_ssid", defaultAPSSID);
   String apPass = preferences.getString("ap_pass", defaultAPPass);
   preferences.end();
 
   Serial.println("\n--- ESP32C3 AP Opstarten ---");
-
-  // Zet de ESP strikt in Access Point modus
   WiFi.mode(WIFI_AP);
   
-  // Start het Access Point met de (opgeslagen) gegevens
-  // Als het wachtwoord korter is dan 8 tekens, start hij als open netwerk
   if (apPass.length() < 8) {
     WiFi.softAP(apSSID.c_str());
-    Serial.println("AP gestart ZONDER wachtwoord (wachtwoord te kort, min. 8 tekens).");
   } else {
     WiFi.softAP(apSSID.c_str(), apPass.c_str());
-    Serial.println("AP gestart MET wachtwoord.");
   }
 
-  Serial.print("Uitgezonden SSID: ");
-  Serial.println(apSSID);
-  Serial.print("IP-adres van de ESP32C3: ");
-  Serial.println(WiFi.softAPIP());
-
-  // Start servers
   setupConfigServer();
   configServer.begin();
+ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  // U_SPIFFS
+        type = "filesystem";
+      }
 
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      if (millis() - last_ota_time > 500) {
+        Serial.printf("Progress: %u%%\n", (progress / (total / 100)));
+        last_ota_time = millis();
+      }
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) {
+        Serial.println("Auth Failed");
+      } else if (error == OTA_BEGIN_ERROR) {
+        Serial.println("Begin Failed");
+      } else if (error == OTA_CONNECT_ERROR) {
+        Serial.println("Connect Failed");
+      } else if (error == OTA_RECEIVE_ERROR) {
+        Serial.println("Receive Failed");
+      } else if (error == OTA_END_ERROR) {
+        Serial.println("End Failed");
+      }
+    });
+
+  ArduinoOTA.begin();
   IPAddress local_IP(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
@@ -167,8 +191,8 @@ void setup() {
   server.setNoDelay(true);
 
   // --- NMEA2000 INITIALISATIE ---
-  uint32_t SerialNumber = GetBoardSerialNumber(); // Uniek nummer uit eFuse via BoardSerialNumber.cpp
-  uint32_t uniqueID = (uint32_t)(SerialNumber & 0x1FFFFF); // NMEA spec max 21 bits
+  uint32_t SerialNumber = GetBoardSerialNumber();
+  uint32_t uniqueID = (uint32_t)(SerialNumber & 0x1FFFFF);
 
   NMEA2000.SetN2kCANMsgBufSize(100);
   NMEA2000.SetN2kCANReceiveFrameBufSize(250);
@@ -184,33 +208,32 @@ void setup() {
   NMEA2000.SetProductInformation("00000001", 100, "N2k->WiFi & Pilot Remote", "2.1.0", "1.0.2.0");
   NMEA2000.SetDeviceInformation(uniqueID, 132, 25, 2046);
 
-  // Open voorkeuren voor het opgeslagen NMEA Node Adres
   preferences.begin("nvs", false);
   NodeAddress = preferences.getInt("LastNodeAddress", 34);
   preferences.end();
 
-  // Luister naar het netwerk én neem deel als eigen node (nodig om te kunnen zenden naar de EV-1)
   NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, NodeAddress);
-
   NMEA2000.ExtendTransmitMessages(TransmitMessages);
   NMEA2000.ExtendReceiveMessages(ReceiveMessages);
 
-  // Handlers instellen
   NMEA2000.AttachMsgHandler(&tN2kDataToNMEA0183);
   tN2kDataToNMEA0183.SetSendNMEA0183MessageCallback(SendNMEA0183Message);
-  
-  // Koppel de Raymarine handler aan de library via een omweg/wrapper als dat nodig is, 
-  // maar de library ondersteunt de directe callback:
   NMEA2000.SetMsgHandler(RaymarinePilot::HandleNMEA2000Msg);
 
   pN2kDeviceList = new tN2kDeviceList(&NMEA2000);
   NMEA2000.Open();
 
-  // --- RF ONTVANGER START ---
+  // --- RF ONTVANGER INITIALISATIE ---
   mySwitch.enableReceive(digitalPinToInterrupt(ESP32_RCSWITCH_PIN));
+
+  // --- CREATE FREE RTOS QUEUE & TASK ---
+  // Wachtrij voor maximaal 10 knop-codes
+  remoteQueue = xQueueCreate(10, sizeof(unsigned long));
+  
+  // Start de hoge prioriteitstaak (Prioriteit 5, loop() draait standaard op 1)
+  xTaskCreate(vRemoteTask, "RemoteTask", 3072, NULL, 5, NULL);
   
   reported = millis();
-  beepOn(2); // Korte piep om aan te geven dat setup klaar is
 }
 
 //*****************************************************************************
@@ -220,14 +243,19 @@ void loop() {
     digitalWrite(LED_BUILTIN, led);
     reported = millis();
   }
+  ArduinoOTA.handle();
   configServer.handleClient();
   CheckConnections();
   NMEA2000.ParseMessages();
   tN2kDataToNMEA0183.Update();
-  Handle_AP_Remote();
-  handleBeep();
 
-  // Adreswijziging detectie en opslag in NVS
+  // Controleer of de RemoteTask een geldige knop in de wachtrij heeft gezet
+  unsigned long receivedKey = 0;
+  if (xQueueReceive(remoteQueue, &receivedKey, 0) == pdTRUE) {
+    ProcessRemoteKey(receivedKey);
+  }
+
+  // Adreswijziging detectie
   int SourceAddress = NMEA2000.GetN2kSource();
   if (SourceAddress != NodeAddress && SourceAddress != 255) { 
     NodeAddress = SourceAddress;
@@ -238,117 +266,128 @@ void loop() {
   }
 }
 
-// --- AFHANDELING EN ZOEKEN NAAR EV-1 ---
 int getDeviceSourceAddress(String model) {
-  if (!pN2kDeviceList->ReadResetIsListUpdated()) return -1;
+  if (pN2kDeviceList == nullptr) {
+    Serial.println("pN2kDeviceList is niet geïnitialiseerd.");
+    return -1;
+  }
+
+  // We lopen net als in jouw originele code langs alle mogelijke bronadressen
   for (uint8_t i = 0; i < N2kMaxBusDevices; i++) {
     const tNMEA2000::tDevice *device = pN2kDeviceList->FindDeviceBySource(i);
-    if (device == 0) continue;
+    if (device == nullptr) continue;
 
-    String modelVersion = device->GetModelVersion();
-    if (modelVersion.indexOf(model) >= 0) {
-      beepOn(2); // Apparaat gevonden piep!
-      Serial.printf("EV-1 Autopilot gevonden op bronadres: %d\n", device->GetSource());
+    // HIER ZIT DE KERN: we vragen nu om GetModelID() in plaats van GetModelVersion()
+    String modelID = device->GetModelID();
+    
+    if (modelID.indexOf(model) >= 0) {
+      Serial.printf("EV-1 Autopilot gevonden op bronadres: %d (Model: %s)\n", device->GetSource(), modelID.c_str());
       return device->GetSource();
     }
   }
-  return -2;
+
+  Serial.printf("Apparaat '%s' niet gevonden in de huidige lijst.\n", model.c_str());
+  return -1;
 }
-unsigned long lastSignalTime;
-bool isKeyPressed;
 
-void Handle_AP_Remote(void) {
-  unsigned long key = 0;
-
+// Wordt exclusief aangeroepen vanuit loop() -> Volledig veilig voor NMEA2000 non-reentrancy!
+void ProcessRemoteKey(unsigned long key) {
+  Serial.print("Ontvangen code in loop: ");
+  Serial.println(key);
   if (pilotSourceAddress < 0) {
-    pilotSourceAddress = getDeviceSourceAddress("EV-1");
+    Serial.println("FOUT: Commando genegeerd. EV-1 stuurautomaat is nog niet gedetecteerd op de bus.");
+    return; 
   }
 
-  if (mySwitch.available()) {
-    key = mySwitch.getReceivedValue();
-    Serial.println(key);
-    mySwitch.resetAvailable();
+  if (key == Key_Standby) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_STANDBY);
+    NMEA2000.SendMsg(N2kMsg);     
   }
-  if (key > 0) {
-    lastSignalTime = millis(); // Reset timeout, button is still held down
-    
-    // First time we detect this key (Button Pressed event)
-    if (!isKeyPressed) {
-      isKeyPressed = true;
-      if (key == Key_Standby) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_STANDBY);
-        NMEA2000.SendMsg(N2kMsg);     
-      }
-      else if (key == Key_Auto) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_AUTO);
-        NMEA2000.SendMsg(N2kMsg);      
-      }
-      else if (key == Key_Plus_1) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_1);
-        NMEA2000.SendMsg(N2kMsg);
-      }
-      else if (key == Key_Plus_10) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_10);
-        NMEA2000.SendMsg(N2kMsg);      
-      }
-      else if (key == Key_Minus_1) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_1);
-        NMEA2000.SendMsg(N2kMsg);      
-      }
-      else if (key == Key_Minus_10) {
-        beepOn(1);
-        if (pilotSourceAddress < 0) return;
-        tN2kMsg N2kMsg;
-        RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_10);
-        NMEA2000.SendMsg(N2kMsg);      
-      }
-    }
+  else if (key == Key_Auto) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_AUTO);
+    NMEA2000.SendMsg(N2kMsg);      
   }
-  if (isKeyPressed && (millis() - lastSignalTime > 200)) {
-    Serial.print("Button RELEASED: ");
-    // Reset states for the next press
-    isKeyPressed = false;
+  else if (key == Key_Plus_1) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_1);
+    NMEA2000.SendMsg(N2kMsg);
+  }
+  else if (key == Key_Plus_10) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_10);
+    NMEA2000.SendMsg(N2kMsg);      
+  }
+  else if (key == Key_Minus_1) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_1);
+    NMEA2000.SendMsg(N2kMsg);      
+  }
+  else if (key == Key_Minus_10) {
+    tN2kMsg N2kMsg;
+    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_10);
+    NMEA2000.SendMsg(N2kMsg);      
   }
 }
 
-// --- BUZZER / BEEP AFHANDELING ---
-void beepOn(int cnt) {
-  if (beep_status == 0) {
-    Serial.println("beep");
-    beep_status = cnt;
+// --- HOGE PRIORITEIT TASK VOOR RF & PIEP TIMING ---
+void vRemoteTask(void *pvParameters) {
+  unsigned long lastSignalTime = 0;
+  bool isKeyPressed = false;
+  
+  int beep_status = 0;
+  unsigned long beep_on = 0;
+  unsigned long beep_off = 0;
+
+  // Geef een opstartpiep (was voorheen beepOn(2))
+  beep_status = 2;
+
+  for (;;) {
+    unsigned long key = 0;
+
+    // 1. Check RF Ontvanger
+    if (mySwitch.available()) {
+      key = mySwitch.getReceivedValue();
+      mySwitch.resetAvailable();
+    }
+
+    if (key > 0) {
+      lastSignalTime = millis();
+      
+      if (!isKeyPressed) {
+        isKeyPressed = true;
+        // Start direct de piep (onafhankelijk van de loop)
+        if (beep_status == 0) beep_status = pilotSourceAddress < 0 ? 2 : 1;
+        // Stuur de code door naar de loop() via de Queue
+        xQueueSend(remoteQueue, &key, 0);
+      }
+    }
+
+    if (isKeyPressed && (millis() - lastSignalTime > 200)) {
+      isKeyPressed = false;
+    }
+
+    // 2. Afhandeling Buzzer Timing (Draait met strakke 10ms intervallen)
+    if (beep_status > 0) {
+      if (!beep_on && (millis() - beep_off >= 200)) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        beep_on = millis();
+        beep_off = 0;
+      }
+      if (beep_on && (millis() - beep_on >= 200)) {
+        digitalWrite(BUZZER_PIN, LOW);
+        beep_status--;
+        beep_on = 0;
+        beep_off = millis();
+      }
+    }
+
+    // 10ms rust geeft andere lagere taken (WiFi/NMEA) ook ademruimte
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
-void handleBeep() {
-  if (beep_status > 0) {
-    if (!beep_on && (millis() - beep_off >= 200)) {
-      digitalWrite(BUZZER_PIN, HIGH);
-      beep_on = millis();
-      beep_off = 0;
-    }
-    if (beep_on && (millis() - beep_on >= 200)) {
-      digitalWrite(BUZZER_PIN, LOW);
-      beep_status--;
-      beep_on = 0;
-      beep_off = millis();
-    }
-  }
-}
 // --- WIFI EN CLIENT STREAM AFHANDELING ---
 #define MAX_NMEA0183_MESSAGE_SIZE 100
 void SendNMEA0183Message(const tNMEA0183Msg &NMEA0183Msg) {
@@ -395,9 +434,9 @@ void CheckConnections() {
     }
   }
 }
-// --- CONFIGURATIE SERVER (Poort 80) ---
+
+// --- CONFIGURATIE SERVER ---
 void setupConfigServer() {
-  // HTML Formulier tonen om de AP-naam aan te passen
   configServer.on("/", HTTP_GET, []() {
     preferences.begin("ap-config", true);
     String currentSSID = preferences.getString("ap_ssid", defaultAPSSID);
@@ -414,7 +453,6 @@ void setupConfigServer() {
     configServer.send(200, "text/html", html);
   });
 
-  // Nieuwe AP gegevens verwerken en opslaan
   configServer.on("/save", HTTP_POST, []() {
     String newAPSSID = configServer.arg("ap_ssid");
     String newAPPass = configServer.arg("ap_pass");
@@ -425,9 +463,9 @@ void setupConfigServer() {
       preferences.putString("ap_pass", newAPPass);
       preferences.end();
       
-      configServer.send(200, "text/html", "<h3>AP Instellingen opgeslagen! De ESP32 start nu opnieuw op met de nieuwe netwerknaam...</h3>");
+      configServer.send(200, "text/html", "<h3>AP Instellingen opgeslagen! De ESP32 start nu opnieuw op...</h3>");
       delay(2000);
-      ESP.restart(); // Herstart om de nieuwe AP-naam actief te maken
+      ESP.restart();
     } else {
       configServer.send(400, "text/plain", "SSID mag niet leeg zijn.");
     }
