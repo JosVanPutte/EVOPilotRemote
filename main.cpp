@@ -38,7 +38,8 @@ Target: ESP32-C3 (Access Point Mode, Fixed IP 192.168.4.1, Port 2222)
 #define ON HIGH
 #define OFF LOW
 
-#define KEY_DELAY 300 
+#define KEY_DELAY 300
+#define BEEP_TIME 200
 #define REPORTINTERVAL 10000
 
 const uint16_t ServerPort = 2222; 
@@ -71,12 +72,9 @@ Preferences preferences;
 RCSwitch mySwitch = RCSwitch();
 short pilotSourceAddress = -1;
 
-// --- QUEUE VOOR COMMUNICATIE TUSSEN TASK EN LOOP ---
-QueueHandle_t remoteQueue;
+unsigned int beep_status;
 
 // --- REMOTE CODES (433 MHz) ---
-const unsigned long Key_Minus_10   = 1111001; 
-const unsigned long Key_Plus_10    = 1111002;
 const unsigned long Key_Minus_1  = 8338932;
 const unsigned long Key_Plus_1   = 8338936;
 const unsigned long Key_Auto      = 8338929;
@@ -108,6 +106,7 @@ void SendBufToClients(const char *buf);
 void CheckConnections();
 void ProcessRemoteKey(unsigned long key);
 void setupConfigServer();
+void Handle_AP_Remote();
 void vRemoteTask(void *pvParameters);
 //*****************************************************************************
 void setup() {
@@ -225,10 +224,6 @@ ArduinoOTA
 
   // --- RF ONTVANGER INITIALISATIE ---
   mySwitch.enableReceive(digitalPinToInterrupt(ESP32_RCSWITCH_PIN));
-
-  // --- CREATE FREE RTOS QUEUE & TASK ---
-  // Wachtrij voor maximaal 10 knop-codes
-  remoteQueue = xQueueCreate(10, sizeof(unsigned long));
   
   // Start de hoge prioriteitstaak (Prioriteit 5, loop() draait standaard op 1)
   xTaskCreate(vRemoteTask, "RemoteTask", 3072, NULL, 5, NULL);
@@ -248,12 +243,7 @@ void loop() {
   CheckConnections();
   NMEA2000.ParseMessages();
   tN2kDataToNMEA0183.Update();
-
-  // Controleer of de RemoteTask een geldige knop in de wachtrij heeft gezet
-  unsigned long receivedKey = 0;
-  if (xQueueReceive(remoteQueue, &receivedKey, 0) == pdTRUE) {
-    ProcessRemoteKey(receivedKey);
-  }
+  Handle_AP_Remote();
 
   // Adreswijziging detectie
   int SourceAddress = NMEA2000.GetN2kSource();
@@ -265,124 +255,90 @@ void loop() {
     Serial.printf("Address Change: New Address=%d\n", SourceAddress);
   }
 }
+unsigned long lastSignalTime;
 
 int getDeviceSourceAddress(String model) {
-  if (pN2kDeviceList == nullptr) {
-    Serial.println("pN2kDeviceList is niet geïnitialiseerd.");
-    return -1;
-  }
-
-  // We lopen net als in jouw originele code langs alle mogelijke bronadressen
+  if (!pN2kDeviceList->ReadResetIsListUpdated()) return -1;
   for (uint8_t i = 0; i < N2kMaxBusDevices; i++) {
     const tNMEA2000::tDevice *device = pN2kDeviceList->FindDeviceBySource(i);
-    if (device == nullptr) continue;
+    if (device == 0) continue;
 
-    // HIER ZIT DE KERN: we vragen nu om GetModelID() in plaats van GetModelVersion()
-    String modelID = device->GetModelID();
-    
-    if (modelID.indexOf(model) >= 0) {
-      Serial.printf("EV-1 Autopilot gevonden op bronadres: %d (Model: %s)\n", device->GetSource(), modelID.c_str());
+    String modelVersion = device->GetModelVersion();
+    if (modelVersion.indexOf(model) >= 0) {
+      Serial.printf("EV-1 Autopilot gevonden op bronadres: %d\n", device->GetSource());
       return device->GetSource();
     }
   }
-
-  Serial.printf("Apparaat '%s' niet gevonden in de huidige lijst.\n", model.c_str());
-  return -1;
+  return -2;
 }
+unsigned long last_key = 0;
 
-// Wordt exclusief aangeroepen vanuit loop() -> Volledig veilig voor NMEA2000 non-reentrancy!
-void ProcessRemoteKey(unsigned long key) {
-  Serial.print("Ontvangen code in loop: ");
-  Serial.println(key);
+void Handle_AP_Remote(void) {
+  unsigned long key = 0;
+
   if (pilotSourceAddress < 0) {
-    Serial.println("FOUT: Commando genegeerd. EV-1 stuurautomaat is nog niet gedetecteerd op de bus.");
-    return; 
+    pilotSourceAddress = getDeviceSourceAddress("EV-1");
+    if (pilotSourceAddress > 0) {
+      beep_status = 2;
+    } else {
+      return;
+    }
   }
 
-  if (key == Key_Standby) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_STANDBY);
-    NMEA2000.SendMsg(N2kMsg);     
+  if (mySwitch.available()) {
+    key = mySwitch.getReceivedValue();
+    Serial.println(key);
+    mySwitch.resetAvailable();
   }
-  else if (key == Key_Auto) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_AUTO);
-    NMEA2000.SendMsg(N2kMsg);      
+  if (key > 0 && millis() > lastSignalTime + KEY_DELAY) {
+    lastSignalTime = millis(); // Reset timeout, button is still held down
+    
+    if (key == Key_Standby && key != last_key) {
+      beep_status = 1;
+      tN2kMsg N2kMsg;
+      RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_STANDBY);
+      NMEA2000.SendMsg(N2kMsg);     
+    }
+    if (key == Key_Auto && key != last_key) {
+      beep_status = 1;
+      tN2kMsg N2kMsg;
+      RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_AUTO);
+      NMEA2000.SendMsg(N2kMsg);      
+    }
+    if (key == Key_Plus_1) {
+      tN2kMsg N2kMsg;
+      RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_1);
+      NMEA2000.SendMsg(N2kMsg);
+    }
+    if (key == Key_Minus_1) {
+      tN2kMsg N2kMsg;
+      RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_1);
+      NMEA2000.SendMsg(N2kMsg);      
+    }
+    last_key = key;
   }
-  else if (key == Key_Plus_1) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_1);
-    NMEA2000.SendMsg(N2kMsg);
-  }
-  else if (key == Key_Plus_10) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_PLUS_10);
-    NMEA2000.SendMsg(N2kMsg);      
-  }
-  else if (key == Key_Minus_1) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_1);
-    NMEA2000.SendMsg(N2kMsg);      
-  }
-  else if (key == Key_Minus_10) {
-    tN2kMsg N2kMsg;
-    RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_10);
-    NMEA2000.SendMsg(N2kMsg);      
-  }
-}
+ }
 
 // --- HOGE PRIORITEIT TASK VOOR RF & PIEP TIMING ---
 void vRemoteTask(void *pvParameters) {
-  unsigned long lastSignalTime = 0;
-  bool isKeyPressed = false;
-  
-  int beep_status = 0;
   unsigned long beep_on = 0;
   unsigned long beep_off = 0;
 
-  // Geef een opstartpiep (was voorheen beepOn(2))
-  beep_status = 2;
-
   for (;;) {
-    unsigned long key = 0;
-
-    // 1. Check RF Ontvanger
-    if (mySwitch.available()) {
-      key = mySwitch.getReceivedValue();
-      mySwitch.resetAvailable();
-    }
-
-    if (key > 0) {
-      lastSignalTime = millis();
-      
-      if (!isKeyPressed) {
-        isKeyPressed = true;
-        // Start direct de piep (onafhankelijk van de loop)
-        if (beep_status == 0) beep_status = pilotSourceAddress < 0 ? 2 : 1;
-        // Stuur de code door naar de loop() via de Queue
-        xQueueSend(remoteQueue, &key, 0);
-      }
-    }
-
-    if (isKeyPressed && (millis() - lastSignalTime > 200)) {
-      isKeyPressed = false;
-    }
-
     // 2. Afhandeling Buzzer Timing (Draait met strakke 10ms intervallen)
     if (beep_status > 0) {
-      if (!beep_on && (millis() - beep_off >= 200)) {
+      if (!beep_on && (millis() - beep_off >= BEEP_TIME)) {
         digitalWrite(BUZZER_PIN, HIGH);
         beep_on = millis();
         beep_off = 0;
       }
-      if (beep_on && (millis() - beep_on >= 200)) {
+      if (beep_on && (millis() - beep_on >= BEEP_TIME)) {
         digitalWrite(BUZZER_PIN, LOW);
         beep_status--;
         beep_on = 0;
         beep_off = millis();
       }
     }
-
     // 10ms rust geeft andere lagere taken (WiFi/NMEA) ook ademruimte
     vTaskDelay(pdMS_TO_TICKS(100));
   }
