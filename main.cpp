@@ -60,6 +60,7 @@ const char* defaultAPPass = ""; // open
 unsigned long reported;
 unsigned int led;
 bool loggingEnabled = false;
+bool AISWiFiEnabled = false;
 
 using tWiFiClientPtr = std::shared_ptr<WiFiClient>;
 LinkedList<tWiFiClientPtr> clients;
@@ -129,6 +130,7 @@ void setup() {
   preferences.begin("ap-config", true);
   String apSSID = preferences.getString("ap_ssid", defaultAPSSID);
   String apPass = preferences.getString("ap_pass", defaultAPPass);
+  AISWiFiEnabled = preferences.getBool("ap_ais", true);
   preferences.end();
 
   Serial.println("\n--- ESP32C3 AP Opstarten ---");
@@ -214,9 +216,10 @@ ArduinoOTA
   NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, NodeAddress);
   NMEA2000.ExtendTransmitMessages(TransmitMessages);
   NMEA2000.ExtendReceiveMessages(ReceiveMessages);
-
-  NMEA2000.AttachMsgHandler(&tN2kDataToNMEA0183);
-  tN2kDataToNMEA0183.SetSendNMEA0183MessageCallback(SendNMEA0183Message);
+  if (AISWiFiEnabled) {
+    NMEA2000.AttachMsgHandler(&tN2kDataToNMEA0183);
+    tN2kDataToNMEA0183.SetSendNMEA0183MessageCallback(SendNMEA0183Message);
+  }
   NMEA2000.SetMsgHandler(RaymarinePilot::HandleNMEA2000Msg);
 
   pN2kDeviceList = new tN2kDeviceList(&NMEA2000);
@@ -240,9 +243,11 @@ void loop() {
   }
   ArduinoOTA.handle();
   configServer.handleClient();
-  CheckConnections();
   NMEA2000.ParseMessages();
-  tN2kDataToNMEA0183.Update();
+  if (AISWiFiEnabled) {
+    CheckConnections();
+    tN2kDataToNMEA0183.Update();
+  }
   Handle_AP_Remote();
 
   // Adreswijziging detectie
@@ -396,14 +401,15 @@ void setupConfigServer() {
   configServer.on("/", HTTP_GET, []() {
     preferences.begin("ap-config", true);
     String currentSSID = preferences.getString("ap_ssid", defaultAPSSID);
-    preferences.end();  
+    preferences.end();
+    String checked = AISWiFiEnabled ? "checked" : "";
     String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
     html += "<style>body{font-family:sans-serif;margin:20px;} input{display:block;margin:10px 0;padding:8px;width:100%;max-width:300px;}</style></head>";
-    html += "<body><h2>ESP32C3 AP Instellingen</h2>";
-    html += "<p>Huidige SSID: <b>" + currentSSID + "</b></p>";
+    html += "<body><h2>EVOPilotRemote Instellingen</h2>";
     html += "<form action='/save' method='POST'>";
-    html += "Nieuwe AP Naam (SSID):<br><input type='text' name='ap_ssid' placeholder='Nieuwe netwerknaam' required>";
-    html += "Nieuw Wachtwoord (min. 8 tekens):<br><input type='password' name='ap_pass' placeholder='Wachtwoord (leeg = open)'>";
+    html += "AP Naam (SSID):<br><input type='text' name='ap_ssid' value='" + currentSSID + "' placeholder='Nieuwe netwerknaam' required>";
+    html += "Wachtwoord (min. 8 tekens):<br><input type='password' name='ap_pass' placeholder='Wachtwoord (leeg = open)'>";
+    html += "AIS data op poort 2222 <input type='checkbox' name='ap_AIS' " + checked + " >";
     html += "<input type='submit' value='Instellingen Toepassen' style='background:#28a745;color:white;border:0;'>";
     html += "</form></body></html>";
     configServer.send(200, "text/html", html);
@@ -412,11 +418,13 @@ void setupConfigServer() {
   configServer.on("/save", HTTP_POST, []() {
     String newAPSSID = configServer.arg("ap_ssid");
     String newAPPass = configServer.arg("ap_pass");
-
+    bool aisOnWifi = configServer.hasArg("ap_AIS");
+  
     if (newAPSSID != "") {
       preferences.begin("ap-config", false);
       preferences.putString("ap_ssid", newAPSSID);
       preferences.putString("ap_pass", newAPPass);
+      preferences.putBool("ap_ais", aisOnWifi);
       preferences.end();
       
       configServer.send(200, "text/html", "<h3>AP Instellingen opgeslagen! De ESP32 start nu opnieuw op...</h3>");
