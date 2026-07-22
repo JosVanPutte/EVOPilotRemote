@@ -73,7 +73,15 @@ Preferences preferences;
 RCSwitch mySwitch = RCSwitch();
 short pilotSourceAddress = -1;
 
-unsigned int beep_status;
+// Volatile/Atomic voor veilige communicatie tussen tasks
+volatile unsigned int beep_status = 0;
+
+// FreeRTOS Queue voor verliesvrije, non-blocking AIS/NMEA0183 overdracht naar WiFi
+#define MAX_NMEA0183_MESSAGE_SIZE 120
+struct NmeaBuffer {
+  char text[MAX_NMEA0183_MESSAGE_SIZE];
+};
+QueueHandle_t nmeaQueue;
 
 // --- REMOTE CODES (433 MHz) ---
 const unsigned long Key_Minus_1  = 8338932;
@@ -108,7 +116,8 @@ void CheckConnections();
 void ProcessRemoteKey(unsigned long key);
 void setupConfigServer();
 void Handle_AP_Remote();
-void vRemoteTask(void *pvParameters);
+void vN2kTask(void *pvParameters);
+
 //*****************************************************************************
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -121,6 +130,9 @@ void setup() {
   delay(1000); 
 
   Serial.println("--- NMEA2000 Wifi Gateway & AP Remote ---");
+
+  // Maak de FreeRTOS Queue aan voor maximaal 20 NMEA-zinnen
+  nmeaQueue = xQueueCreate(20, sizeof(NmeaBuffer));
 
   // --- START WIFI ACCESS POINT ---
   WiFi.softAPdisconnect(true);
@@ -144,21 +156,13 @@ void setup() {
 
   setupConfigServer();
   configServer.begin();
-ArduinoOTA
-    .onStart([]() {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH) {
-        type = "sketch";
-      } else {  // U_SPIFFS
-        type = "filesystem";
-      }
 
-      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+  ArduinoOTA
+    .onStart([]() {
+      String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
       Serial.println("Start updating " + type);
     })
-    .onEnd([]() {
-      Serial.println("\nEnd");
-    })
+    .onEnd([]() { Serial.println("\nEnd"); })
     .onProgress([](unsigned int progress, unsigned int total) {
       if (millis() - last_ota_time > 500) {
         Serial.printf("Progress: %u%%\n", (progress / (total / 100)));
@@ -166,18 +170,7 @@ ArduinoOTA
       }
     })
     .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) {
-        Serial.println("Auth Failed");
-      } else if (error == OTA_BEGIN_ERROR) {
-        Serial.println("Begin Failed");
-      } else if (error == OTA_CONNECT_ERROR) {
-        Serial.println("Connect Failed");
-      } else if (error == OTA_RECEIVE_ERROR) {
-        Serial.println("Receive Failed");
-      } else if (error == OTA_END_ERROR) {
-        Serial.println("End Failed");
-      }
+      Serial.printf("Error[%u]\n", error);
     });
 
   ArduinoOTA.begin();
@@ -228,12 +221,14 @@ ArduinoOTA
   // --- RF ONTVANGER INITIALISATIE ---
   mySwitch.enableReceive(digitalPinToInterrupt(ESP32_RCSWITCH_PIN));
   
-  // Start de hoge prioriteitstaak (Prioriteit 5, loop() draait standaard op 1)
-  xTaskCreate(vRemoteTask, "RemoteTask", 3072, NULL, 5, NULL);
+  // Start de dedicated NMEA2000 + Remote Task (Prioriteit 5)
+  xTaskCreate(vN2kTask, "N2kTask", 4096, NULL, 5, NULL);
   
   reported = millis();
 }
 
+//*****************************************************************************
+// MAIN LOOP: Behandelt ALLEEN WiFi, OTA, WebServer en verzendt NMEA-data uit Queue
 //*****************************************************************************
 void loop() {
   if (millis() > reported + REPORTINTERVAL) {
@@ -241,26 +236,71 @@ void loop() {
     digitalWrite(LED_BUILTIN, led);
     reported = millis();
   }
+
   ArduinoOTA.handle();
   configServer.handleClient();
-  NMEA2000.ParseMessages();
+
   if (AISWiFiEnabled) {
     CheckConnections();
-    tN2kDataToNMEA0183.Update();
-  }
-  Handle_AP_Remote();
 
-  // Adreswijziging detectie
-  int SourceAddress = NMEA2000.GetN2kSource();
-  if (SourceAddress != NodeAddress && SourceAddress != 255) { 
-    NodeAddress = SourceAddress;
-    preferences.begin("nvs", false);
-    preferences.putInt("LastNodeAddress", SourceAddress);
-    preferences.end();
-    Serial.printf("Address Change: New Address=%d\n", SourceAddress);
+    // Verwerk eventuele berichten uit de FreeRTOS Queue en stuur naar WiFi clients
+    NmeaBuffer item;
+    while (xQueueReceive(nmeaQueue, &item, 0) == pdTRUE) {
+      SendBufToClients(item.text);
+    }
+  }
+
+  // Geef de netwerk-stack kort rust om klemmen te voorkomen
+  vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+// --- HIGH PRIORITY TASK: NMEA2000, 433MHz Remote & Buzzer Timing ---
+void vN2kTask(void *pvParameters) {
+  unsigned long beep_on = 0;
+  unsigned long beep_off = 0;
+
+  for (;;) {
+    // 1. Verwerk NMEA2000 berichten
+    NMEA2000.ParseMessages();
+    if (AISWiFiEnabled) {
+      tN2kDataToNMEA0183.Update();
+    }
+
+    // 2. Afhandeling RF Afstandsbediening & Stuurautomaat commando's
+    Handle_AP_Remote();
+
+    // 3. N2K Adreswijziging detectie
+    int SourceAddress = NMEA2000.GetN2kSource();
+    if (SourceAddress != NodeAddress && SourceAddress != 255) { 
+      NodeAddress = SourceAddress;
+      preferences.begin("nvs", false);
+      preferences.putInt("LastNodeAddress", SourceAddress);
+      preferences.end();
+      Serial.printf("Address Change: New Address=%d\n", SourceAddress);
+    }
+
+    // 4. Afhandeling Buzzer Timing (snelle responstijd)
+    if (beep_status > 0) {
+      if (!beep_on && (millis() - beep_off >= BEEP_TIME)) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        beep_on = millis();
+        beep_off = 0;
+      }
+      if (beep_on && (millis() - beep_on >= BEEP_TIME)) {
+        digitalWrite(BUZZER_PIN, LOW);
+        beep_status--;
+        beep_on = 0;
+        beep_off = millis();
+      }
+    }
+
+    // Kort pauzeren om de task te refreshen (2ms is voldoende om heel direct te reageren)
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
-unsigned long lastSignalTime;
+
+unsigned long lastSignalTime = 0;
+unsigned long last_key = 0;
 
 int getDeviceSourceAddress(String model) {
   if (!pN2kDeviceList->ReadResetIsListUpdated()) return -1;
@@ -276,7 +316,6 @@ int getDeviceSourceAddress(String model) {
   }
   return -2;
 }
-unsigned long last_key = 0;
 
 void Handle_AP_Remote(void) {
   unsigned long key = 0;
@@ -295,8 +334,9 @@ void Handle_AP_Remote(void) {
     Serial.println(key);
     mySwitch.resetAvailable();
   }
+
   if (key > 0 && millis() > lastSignalTime + KEY_DELAY) {
-    lastSignalTime = millis(); // Reset timeout, button is still held down
+    lastSignalTime = millis();
     
     if (key == Key_Standby && key != last_key) {
       beep_status = 1;
@@ -308,7 +348,7 @@ void Handle_AP_Remote(void) {
       beep_status = 1;
       tN2kMsg N2kMsg;
       RaymarinePilot::SetEvoPilotMode(N2kMsg, pilotSourceAddress, PILOT_MODE_AUTO);
-      NMEA2000.SendMsg(N2kMsg);      
+      NMEA2000.SendMsg(N2kMsg);     
     }
     if (key == Key_Plus_1) {
       tN2kMsg N2kMsg;
@@ -318,49 +358,29 @@ void Handle_AP_Remote(void) {
     if (key == Key_Minus_1) {
       tN2kMsg N2kMsg;
       RaymarinePilot::KeyCommand(N2kMsg, pilotSourceAddress, KEY_MINUS_1);
-      NMEA2000.SendMsg(N2kMsg);      
+      NMEA2000.SendMsg(N2kMsg);     
     }
     last_key = key;
   }
- }
+}
 
-// --- HOGE PRIORITEIT TASK VOOR RF & PIEP TIMING ---
-void vRemoteTask(void *pvParameters) {
-  unsigned long beep_on = 0;
-  unsigned long beep_off = 0;
-
-  for (;;) {
-    // 2. Afhandeling Buzzer Timing (Draait met strakke 10ms intervallen)
-    if (beep_status > 0) {
-      if (!beep_on && (millis() - beep_off >= BEEP_TIME)) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        beep_on = millis();
-        beep_off = 0;
-      }
-      if (beep_on && (millis() - beep_on >= BEEP_TIME)) {
-        digitalWrite(BUZZER_PIN, LOW);
-        beep_status--;
-        beep_on = 0;
-        beep_off = millis();
-      }
-    }
-    // 10ms rust geeft andere lagere taken (WiFi/NMEA) ook ademruimte
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
+// --- CALLBACK VOOR NMEA0183 BERICHTEN ---
+void SendNMEA0183Message(const tNMEA0183Msg &NMEA0183Msg) {
+  NmeaBuffer item;
+  if (!NMEA0183Msg.GetMessage(item.text, MAX_NMEA0183_MESSAGE_SIZE)) return;
+  
+  // Stuur bericht naar de Queue zonder de thread te blokkeren als de queue vol is
+  xQueueSend(nmeaQueue, &item, 0);
 }
 
 // --- WIFI EN CLIENT STREAM AFHANDELING ---
-#define MAX_NMEA0183_MESSAGE_SIZE 100
-void SendNMEA0183Message(const tNMEA0183Msg &NMEA0183Msg) {
-  char buf[MAX_NMEA0183_MESSAGE_SIZE];
-  if (!NMEA0183Msg.GetMessage(buf, MAX_NMEA0183_MESSAGE_SIZE)) return;
-  SendBufToClients(buf);
-}
-
 void SendBufToClients(const char *buf) {
-  for (auto it = clients.begin(); it != clients.end(); it++) {
+  for (auto it = clients.begin(); it != clients.end(); ) {
     if ((*it) != NULL && (*it)->connected()) {
       (*it)->println(buf);
+      ++it;
+    } else {
+      it = clients.erase(it);
     }
   }
 }
@@ -380,7 +400,7 @@ void CheckConnections() {
   WiFiClient client = server.available(); 
   if (client) AddClient(client);
 
-  for (auto it = clients.begin(); it != clients.end(); it++) {
+  for (auto it = clients.begin(); it != clients.end(); ) {
     if ((*it) != NULL) {
       if (!(*it)->connected()) {
         StopClient(it);
@@ -389,6 +409,7 @@ void CheckConnections() {
           char c = (*it)->read();
           if (c == 0x03) StopClient(it); 
         }
+        ++it;
       }
     } else {
       it = clients.erase(it); 
